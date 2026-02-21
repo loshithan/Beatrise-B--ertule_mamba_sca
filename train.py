@@ -198,12 +198,17 @@ def train(
     y_train_t = torch.from_numpy(y_train.astype(np.int64))
     X_val_t   = torch.from_numpy(X_val_n)
 
-    # ── DataLoader ────────────────────────────────────────────────────────
+    # ── DataLoaders ───────────────────────────────────────────────────────
     # Batch size = 768 (Table 4.4)
     train_loader = DataLoader(
         TensorDataset(X_train_t, y_train_t),
         batch_size = 768,       # Table 4.4 — exact value
         shuffle    = True,
+    )
+    val_loader = DataLoader(
+        TensorDataset(X_val_t, torch.from_numpy(y_val.astype(np.int64))),
+        batch_size = 768,
+        shuffle    = False,
     )
 
     # ── Optimiser (Section 4.4.2, Table 4.4) ─────────────────────────────
@@ -241,6 +246,18 @@ def train(
 
         train_loss /= len(X_train_t)
 
+        # ── Eval loss — cross-entropy on unseen validation traces ─────────
+        model.eval()
+        eval_loss = 0.0
+        with torch.no_grad():
+            for X_batch, y_batch in val_loader:
+                X_batch = X_batch.to(device)
+                y_batch = y_batch.to(device)
+                logits  = model(X_batch)
+                loss    = criterion(logits, y_batch)
+                eval_loss += loss.item() * len(X_batch)
+        eval_loss /= len(X_val_t)
+
         # ── Validate with mean GE (Section 4.4.2) ────────────────────────
         # Paper: "mean GE measures the average rank of the correct key byte
         #         across 100 attack executions"
@@ -262,6 +279,7 @@ def train(
         print(
             f"Epoch {epoch+1:3d}/100 | "
             f"train_loss: {train_loss:.4f} | "
+            f"eval_loss: {eval_loss:.4f} | "
             f"val_GE: {val_ge:.4f}"
         )
 
