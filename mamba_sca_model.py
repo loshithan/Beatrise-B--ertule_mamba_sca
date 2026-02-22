@@ -88,7 +88,7 @@ WHAT IS DELIBERATELY ABSENT (tested and excluded by paper, Sec 4.3.3)
 import torch
 import torch.nn as nn
 
-from .mamba_encoder_block import MambaEncoderBlock
+from mamba_encoder_block import MambaEncoderBlock
 
 
 class MambaSCAModel(nn.Module):

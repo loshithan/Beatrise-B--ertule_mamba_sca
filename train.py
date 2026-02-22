@@ -221,8 +221,19 @@ def train(
     # Adam with weight decay (weight_decay value not specified, use standard 1e-4)
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr           = 5e-3,    # Table 4.4 — exact value
+        lr           = 5e-3,    # Table 4.4 — exact value (peak LR)
         weight_decay = 1e-4,    # decoupled weight decay (AdamW, not L2 mixed into grad)
+    )
+
+    # ── LR Scheduler: Cosine Annealing ────────────────────────────────────
+    # Root cause of GE diverging after epoch 25: gnorm grew 0.17 → 2.28
+    # (13×), meaning the model kept overshooting the good solution it found.
+    # CosineAnnealingLR smoothly decays lr from peak (5e-3) to min (5e-5)
+    # over 100 epochs, letting the model refine without overshooting.
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max   = 100,
+        eta_min = 5e-5,     # 100× below peak — fine-tuning territory at epoch 100
     )
 
     # ── Loss (Section 4.3.1) ──────────────────────────────────────────────
@@ -255,7 +266,9 @@ def train(
 
             # Optimizer step every ACCUM_STEPS micro-batches
             if (step + 1) % ACCUM_STEPS == 0:
-                gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float('inf'))
+                # Clip gradients to prevent unchecked gnorm growth
+                # (gnorm hit 2.28 at epoch 54 with no clipping — direct cause of GE divergence)
+                gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 gnorm_sum += gnorm.item()
                 n_updates += 1
                 optimizer.step()
@@ -263,7 +276,7 @@ def train(
 
         # Flush any remaining accumulated gradients at the end of the epoch
         if (step + 1) % ACCUM_STEPS != 0:
-            gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float('inf'))
+            gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             gnorm_sum += gnorm.item()
             n_updates += 1
             optimizer.step()
@@ -302,11 +315,13 @@ def train(
             device      = device,
         )
 
+        current_lr = optimizer.param_groups[0]['lr']
         print(
             f"Epoch {epoch+1:3d}/100 | "
             f"train_loss: {train_loss:.4f} | "
             f"eval_loss: {eval_loss:.4f} | "
             f"gnorm: {avg_gnorm:.4f} | "
+            f"lr: {current_lr:.2e} | "
             f"val_GE: {val_ge:.4f}"
         )
 
@@ -321,6 +336,9 @@ def train(
                 'mean_std'   : (mean, std),
             }, save_path)
             print(f"  → Saved checkpoint (val_GE={best_ge:.4f} at epoch {best_epoch})")
+
+        # ── Step the cosine LR scheduler ──────────────────────────────────
+        scheduler.step()
 
     print(f"\nTraining complete. Best val_GE = {best_ge:.4f} at epoch {best_epoch}.")
     return best_ge, best_epoch

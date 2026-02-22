@@ -19,8 +19,8 @@ Paper: "Deep Learning-based Side-Channel Attack: Mamba Approach"
 import torch
 import torch.nn as nn
 
-from .rms_norm        import RMSNorm
-from .core_mamba_block import CoreMambaBlock
+from rms_norm        import RMSNorm
+from core_mamba_block import CoreMambaBlock
 
 
 class MambaEncoderBlock(nn.Module):
