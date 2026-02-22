@@ -26,6 +26,29 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+@torch.jit.script
+def _ssm_scan(
+    deltaA  : torch.Tensor,   # [B, L, d_inner, d_state]
+    deltaB_u: torch.Tensor,   # [B, L, d_inner, d_state]
+    C       : torch.Tensor,   # [B, L, d_state]
+) -> torch.Tensor:            # [B, L, d_inner]
+    """
+    Sequential SSM recurrence compiled with TorchScript.
+    Numerically identical to original — eliminates Python loop overhead.
+    h[t] = Ā[t]*h[t-1] + B̄[t],   y[t] = C[t]·h[t]
+    """
+    B_b     = deltaA.shape[0]
+    L       = deltaA.shape[1]
+    d_inner = deltaA.shape[2]
+    d_state = deltaA.shape[3]
+    h = torch.zeros(B_b, d_inner, d_state, device=deltaA.device, dtype=deltaA.dtype)
+    y = torch.zeros(B_b, L, d_inner,       device=deltaA.device, dtype=deltaA.dtype)
+    for t in range(L):
+        h = deltaA[:, t, :, :] * h + deltaB_u[:, t, :, :]
+        y[:, t, :] = (h * C[:, t, None, :]).sum(dim=-1)
+    return y
+
+
 class CoreMambaBlock(nn.Module):
     """
     Inner Mamba S6 block WITHOUT residual connection.
@@ -160,29 +183,12 @@ class CoreMambaBlock(nn.Module):
             * u.unsqueeze(-1)      # [B, L, d_inner, 1]
         )                                               # [B, L, d_inner, d_state]
 
-        # ── Parallel scan (vectorized, no Python loop) ───────────────────
-        # Closed-form solution of h[t] = Ā[t]*h[t-1] + B̄[t],  h[-1] = 0:
-        #
-        #   cum_a[t]  = ∏_{s=0}^{t} Ā[s]          (cumprod along L)
-        #   h[t]      = cum_a[t] * cumsum(B̄ / cum_a)[t]
-        #   y[t]      = Σ_s  h[t,i,s] * C[t,s]
-        #
-        # Replaces the O(L) Python for-loop with a single fused NumPy-style
-        # tensor operation — all 700 time steps computed in parallel on the GPU.
-
-        # cum_a[b,t,i,s] = ∏_{r=0..t} Ā[b,r,i,s]
-        cum_a = torch.cumprod(deltaA, dim=1)            # [B, L, d_inner, d_state]
-
-        # ratio[b,t,i,s] = B̄[b,t,i,s] / cum_a[b,t,i,s]
-        # clamp avoids division by zero (cum_a is always positive but may underflow)
-        ratio = deltaB_u / cum_a.clamp(min=1e-30)       # [B, L, d_inner, d_state]
-
-        # h[b,t,i,s] = cum_a[t] * cumsum(ratio)[t]
-        h = cum_a * torch.cumsum(ratio, dim=1)           # [B, L, d_inner, d_state]
-
-        # y[b,t,i] = Σ_s h[b,t,i,s] * C[b,t,s]
-        y = (h * C[:, :, None, :]).sum(dim=-1)           # [B, L, d_inner]
-        y = y + u * D[None, None, :]                     # skip connection
+        # ── TorchScript sequential scan ────────────────────────────────────
+        # @torch.jit.script compiles the for-loop to TorchScript IR,
+        # removing Python interpreter overhead on every forward call.
+        # Math is byte-for-byte identical to the original sequential scan.
+        y = _ssm_scan(deltaA, deltaB_u, C)              # [B, L, d_inner]
+        y = y + u * D[None, None, :]                    # skip connection
         return y
 
     # ─────────────────────────────────────────────────────────────────────────
