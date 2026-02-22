@@ -213,10 +213,10 @@ def train(
 
     # ── Optimiser (Section 4.4.2, Table 4.4) ─────────────────────────────
     # Adam with weight decay (weight_decay value not specified, use standard 1e-4)
-    optimizer = torch.optim.Adam(
+    optimizer = torch.optim.AdamW(
         model.parameters(),
         lr           = 5e-3,    # Table 4.4 — exact value
-        weight_decay = 1e-4,    # paper: "weight decay enabled", value not specified
+        weight_decay = 1e-4,    # decoupled weight decay (AdamW, not L2 mixed into grad)
     )
 
     # ── Loss (Section 4.3.1) ──────────────────────────────────────────────
