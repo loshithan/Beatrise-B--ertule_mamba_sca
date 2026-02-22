@@ -28,24 +28,45 @@ import torch.nn.functional as F
 
 @torch.jit.script
 def _ssm_scan(
-    deltaA  : torch.Tensor,   # [B, L, d_inner, d_state]
-    deltaB_u: torch.Tensor,   # [B, L, d_inner, d_state]
-    C       : torch.Tensor,   # [B, L, d_state]
-) -> torch.Tensor:            # [B, L, d_inner]
+    u     : torch.Tensor,   # [B, L, d_inner]
+    delta : torch.Tensor,   # [B, L, d_inner]
+    A     : torch.Tensor,   # [d_inner, d_state]  (negative)
+    B     : torch.Tensor,   # [B, L, d_state]
+    C     : torch.Tensor,   # [B, L, d_state]
+    D     : torch.Tensor,   # [d_inner]
+) -> torch.Tensor:          # [B, L, d_inner]
     """
     Sequential SSM recurrence compiled with TorchScript.
-    Numerically identical to original — eliminates Python loop overhead.
-    h[t] = Ā[t]*h[t-1] + B̄[t],   y[t] = C[t]·h[t]
+    Computes deltaA_t and deltaB_u_t per step to avoid pre-allocating
+    the full [B, L, d_inner, d_state] tensors (490 MB each per block).
+    Peak memory: O(B * d_inner * d_state) instead of O(B * L * d_inner * d_state).
+
+    h[t] = exp(delta[t]*A) * h[t-1] + delta[t]*B[t]*u[t]
+    y[t] = C[t] . h[t] + D * u[t]
     """
-    B_b     = deltaA.shape[0]
-    L       = deltaA.shape[1]
-    d_inner = deltaA.shape[2]
-    d_state = deltaA.shape[3]
-    h = torch.zeros(B_b, d_inner, d_state, device=deltaA.device, dtype=deltaA.dtype)
-    y = torch.zeros(B_b, L, d_inner,       device=deltaA.device, dtype=deltaA.dtype)
+    B_b     = u.shape[0]
+    L       = u.shape[1]
+    d_inner = u.shape[2]
+    d_state = A.shape[1]
+
+    h = torch.zeros(B_b, d_inner, d_state, device=u.device, dtype=u.dtype)
+    y = torch.zeros(B_b, L, d_inner,       device=u.device, dtype=u.dtype)
+
     for t in range(L):
-        h = deltaA[:, t, :, :] * h + deltaB_u[:, t, :, :]
-        y[:, t, :] = (h * C[:, t, None, :]).sum(dim=-1)
+        dt = delta[:, t, :]                             # [B, d_inner]
+        ut = u[:, t, :]                                 # [B, d_inner]
+        Bt = B[:, t, :]                                 # [B, d_state]
+        Ct = C[:, t, :]                                 # [B, d_state]
+
+        # Ā[t] = exp(Δ[t] * A)  — [B, d_inner, d_state]
+        dA  = torch.exp(dt.unsqueeze(-1) * A[None, :, :])
+        # B̄[t] = Δ[t] * B[t] * u[t]  — [B, d_inner, d_state]
+        dBu = dt.unsqueeze(-1) * Bt.unsqueeze(1) * ut.unsqueeze(-1)
+
+        h = dA * h + dBu
+        y[:, t, :] = (h * Ct.unsqueeze(1)).sum(dim=-1)
+
+    y = y + u * D[None, None, :]
     return y
 
 
@@ -169,26 +190,17 @@ class CoreMambaBlock(nn.Module):
         Args / Returns: see type hints above.
         """
         B_b, L, d_inner = u.shape
-        d_state = A.shape[1]
 
-        # Discretise: Ā[b,t,i,s] = exp(Δ[b,t,i] * A[i,s])
-        deltaA = torch.exp(
-            delta.unsqueeze(-1) * A[None, None, :, :]
-        )                                               # [B, L, d_inner, d_state]
+        # A: fixed diagonal structure, always negative
+        A = -torch.exp(self.A_log.float())             # [d_inner, d_state]
 
-        # B̄[b,t,i,s] = Δ[b,t,i] * B[b,t,s] * u[b,t,i]
-        deltaB_u = (
-            delta.unsqueeze(-1)    # [B, L, d_inner, 1]
-            * B[:, :, None, :]     # [B, L,       1, d_state]
-            * u.unsqueeze(-1)      # [B, L, d_inner, 1]
-        )                                               # [B, L, d_inner, d_state]
-
-        # ── TorchScript sequential scan ────────────────────────────────────
-        # @torch.jit.script compiles the for-loop to TorchScript IR,
-        # removing Python interpreter overhead on every forward call.
-        # Math is byte-for-byte identical to the original sequential scan.
-        y = _ssm_scan(deltaA, deltaB_u, C)              # [B, L, d_inner]
-        y = y + u * D[None, None, :]                    # skip connection
+        # ── TorchScript scan: computes Ā and B̄ per step ─────────────────────
+        # deltaA and deltaB_u are computed per time-step inside the compiled
+        # function — avoids pre-allocating [B, L, d_inner, d_state] tensors.
+        # Peak memory: O(B*d_inner*d_state) ≈ 4 MB  vs  O(B*L*d_inner*d_state) ≈ 490 MB
+        y = _ssm_scan(
+            u, delta, A, B, C, D
+        )                                               # [B, L, d_inner]
         return y
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -223,8 +235,8 @@ class CoreMambaBlock(nn.Module):
         # A: fixed diagonal structure, always negative
         A = -torch.exp(self.A_log.float())             # [d_inner, d_state]
 
-        # ── Selective scan ────────────────────────────────────────────────
-        y = self._selective_scan(
+        # ── Selective scan (TorchScript, per-step discretisation) ─────────
+        y = _ssm_scan(
             x_conv.float(), delta.float(),
             A, B_mat.float(), C_mat.float(), self.D.float()
         ).to(x.dtype)                                  # [B, L, d_inner]
