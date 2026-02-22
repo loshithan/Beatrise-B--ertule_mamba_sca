@@ -233,6 +233,8 @@ def train(
         # ── Train ─────────────────────────────────────────────────────────
         model.train()
         train_loss = 0.0
+        gnorm_sum  = 0.0          # accumulate gradient norm each step
+        n_steps    = 0
         for X_batch, y_batch in train_loader:
             X_batch = X_batch.to(device)
             y_batch = y_batch.to(device)
@@ -241,10 +243,18 @@ def train(
             logits = model(X_batch)
             loss   = criterion(logits, y_batch)
             loss.backward()
+
+            # Gradient norm — computed BEFORE optimizer.step() so grads are intact
+            # max_norm=inf means compute-only, no clipping applied
+            gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float('inf'))
+            gnorm_sum += gnorm.item()
+            n_steps   += 1
+
             optimizer.step()
             train_loss += loss.item() * len(X_batch)
 
         train_loss /= len(X_train_t)
+        avg_gnorm   = gnorm_sum / n_steps     # mean gnorm across all mini-batches
 
         # ── Eval loss — cross-entropy on unseen validation traces ─────────
         model.eval()
@@ -280,6 +290,7 @@ def train(
             f"Epoch {epoch+1:3d}/100 | "
             f"train_loss: {train_loss:.4f} | "
             f"eval_loss: {eval_loss:.4f} | "
+            f"gnorm: {avg_gnorm:.4f} | "
             f"val_GE: {val_ge:.4f}"
         )
 
