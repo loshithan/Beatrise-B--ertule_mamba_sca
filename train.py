@@ -148,12 +148,13 @@ def compute_guessing_entropy(
         probs_sub = all_probs[idx]                      # [n_traces, 256]
         hyp_sub   = hyp_labels[idx]                     # [n_traces, 256]
 
-        # Accumulate log-likelihoods for each key candidate
-        # score[k] = sum_j log( P_j( S_box[p_j XOR k] ) )
-        scores = np.zeros(256, dtype=np.float64)
-        for k in range(256):
-            log_probs   = np.log(probs_sub[np.arange(n_traces), hyp_sub[:, k]] + eps)
-            scores[k]   = log_probs.sum()
+        # Accumulate log-likelihoods for each key candidate — vectorized
+        # log_probs_all[j, k] = log( P_j( S_box[p_j XOR k] ) )
+        # scores[k] = sum_j log_probs_all[j, k]
+        log_probs_all = np.log(
+            probs_sub[np.arange(n_traces)[:, None], hyp_sub] + eps   # [n_traces, 256]
+        )
+        scores = log_probs_all.sum(axis=0)                            # [256]
 
         # Rank = position of correct key in descending score order
         rank = np.where(np.argsort(scores)[::-1] == correct_key)[0][0]
