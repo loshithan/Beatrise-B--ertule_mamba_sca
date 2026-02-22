@@ -358,45 +358,40 @@ def evaluate_attack(
         pt_byte[:, None] ^ np.arange(256, dtype=np.uint8)[None, :]
     ]                                               # [N, 256]
 
-    # ── 1. Key rank on full 10,000 traces ────────────────────────────────
-    scores_full = np.zeros(256, dtype=np.float64)
-    for k in range(256):
-        scores_full[k] = np.log(
-            all_probs[np.arange(N), hyp_labels[:, k]] + eps
-        ).sum()
+    # ── 1. Key rank on full 10,000 traces — vectorized ───────────────────
+    log_probs_full = np.log(
+        all_probs[np.arange(N)[:, None], hyp_labels] + eps   # [N, 256]
+    )
+    scores_full = log_probs_full.sum(axis=0)                  # [256]
     key_rank = int(np.where(np.argsort(scores_full)[::-1] == correct_key)[0][0])
 
-    # ── 2. Mean GE + Median GE over 100 runs (Section 4.4.3) ─────────────
+    # ── 2. Mean GE + Median GE over 100 runs — vectorized ────────────────
     ranks = []
     for _ in range(100):
         idx = np.random.choice(N, size=1000, replace=False)
-        scores = np.zeros(256, dtype=np.float64)
-        for k in range(256):
-            scores[k] = np.log(
-                all_probs[idx][np.arange(1000), hyp_labels[idx, k]] + eps
-            ).sum()
+        log_probs_sub = np.log(
+            all_probs[idx][np.arange(1000)[:, None], hyp_labels[idx]] + eps   # [1000, 256]
+        )
+        scores = log_probs_sub.sum(axis=0)                                      # [256]
         rank = int(np.where(np.argsort(scores)[::-1] == correct_key)[0][0])
         ranks.append(rank)
 
     mean_ge   = float(np.mean(ranks))
     median_ge = float(np.median(ranks))
 
-    # ── 3. GE convergence over 1,000 traces (Section 4.4.3) ──────────────
-    # Average rank as function of number of traces processed
-    ge_convergence = []
+    # ── 3. GE convergence over 1,000 traces — fully vectorized ───────────
+    # cumsum over traces gives running score; argsort each row for the rank
     conv_ranks = []
     for _ in range(100):
         idx = np.random.choice(N, size=1000, replace=False)
-        trace_ranks = []
-        scores = np.zeros(256, dtype=np.float64)
-        for t in range(1000):
-            k_idx = hyp_labels[idx[t], :]               # [256]
-            log_p = np.log(all_probs[idx[t], k_idx] + eps)
-            scores += log_p
-            rank = int(np.where(np.argsort(scores)[::-1] == correct_key)[0][0])
-            trace_ranks.append(rank)
+        log_probs_sub = np.log(
+            all_probs[idx][np.arange(1000)[:, None], hyp_labels[idx]] + eps   # [1000, 256]
+        )
+        cum_scores  = np.cumsum(log_probs_sub, axis=0)                         # [1000, 256]
+        sorted_idx  = np.argsort(cum_scores, axis=1)[:, ::-1]                  # [1000, 256]
+        trace_ranks = np.argmax(sorted_idx == correct_key, axis=1)             # [1000]
         conv_ranks.append(trace_ranks)
-    ge_convergence = np.mean(conv_ranks, axis=0)        # [1000]
+    ge_convergence = np.mean(conv_ranks, axis=0)                                # [1000]
 
     ge_conv_value  = float(ge_convergence[-1])
     ge_conv_trace  = int(np.argmax(ge_convergence <= 1.0)) if (ge_convergence <= 1.0).any() else 1000
