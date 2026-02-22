@@ -200,15 +200,20 @@ def train(
     X_val_t   = torch.from_numpy(X_val_n)
 
     # ── DataLoaders ───────────────────────────────────────────────────────
-    # Batch size = 768 (Table 4.4)
+    # Effective batch_size = 768 (Table 4.4) achieved via gradient accumulation:
+    # micro_batch=256 × ACCUM_STEPS=3 = 768 (mathematically identical to a
+    # single batch of 768, but uses 1/3 the GPU memory — needed for D_STATE=16)
+    MICRO_BATCH = 256
+    ACCUM_STEPS = 3     # 3 × 256 = 768  ≡  Table 4.4
+
     train_loader = DataLoader(
         TensorDataset(X_train_t, y_train_t),
-        batch_size = 768,       # Table 4.4 — exact value
+        batch_size = MICRO_BATCH,
         shuffle    = True,
     )
     val_loader = DataLoader(
         TensorDataset(X_val_t, torch.from_numpy(y_val.astype(np.int64))),
-        batch_size = 768,
+        batch_size = MICRO_BATCH,
         shuffle    = False,
     )
 
@@ -231,31 +236,41 @@ def train(
     # ── Training loop: max 100 epochs (Section 4.4.2) ────────────────────
     for epoch in range(100):    # Section 4.4.2 — exact value
 
-        # ── Train ─────────────────────────────────────────────────────────
+        # ── Train (gradient accumulation: micro×3 = effective batch 768) ──
         model.train()
         train_loss = 0.0
-        gnorm_sum  = 0.0          # accumulate gradient norm each step
-        n_steps    = 0
-        for X_batch, y_batch in train_loader:
+        gnorm_sum  = 0.0
+        n_updates  = 0
+        optimizer.zero_grad()
+
+        for step, (X_batch, y_batch) in enumerate(train_loader):
             X_batch = X_batch.to(device)
             y_batch = y_batch.to(device)
 
-            optimizer.zero_grad()
+            # Scale loss so accumulated gradient == gradient from full batch of 768
             logits = model(X_batch)
-            loss   = criterion(logits, y_batch)
+            loss   = criterion(logits, y_batch) / ACCUM_STEPS
             loss.backward()
+            train_loss += loss.item() * ACCUM_STEPS * len(X_batch)
 
-            # Gradient norm — computed BEFORE optimizer.step() so grads are intact
-            # max_norm=inf means compute-only, no clipping applied
+            # Optimizer step every ACCUM_STEPS micro-batches
+            if (step + 1) % ACCUM_STEPS == 0:
+                gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float('inf'))
+                gnorm_sum += gnorm.item()
+                n_updates += 1
+                optimizer.step()
+                optimizer.zero_grad()
+
+        # Flush any remaining accumulated gradients at the end of the epoch
+        if (step + 1) % ACCUM_STEPS != 0:
             gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float('inf'))
             gnorm_sum += gnorm.item()
-            n_steps   += 1
-
+            n_updates += 1
             optimizer.step()
-            train_loss += loss.item() * len(X_batch)
+            optimizer.zero_grad()
 
         train_loss /= len(X_train_t)
-        avg_gnorm   = gnorm_sum / n_steps     # mean gnorm across all mini-batches
+        avg_gnorm   = gnorm_sum / max(n_updates, 1)
 
         # ── Eval loss — cross-entropy on unseen validation traces ─────────
         model.eval()
