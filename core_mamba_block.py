@@ -160,21 +160,29 @@ class CoreMambaBlock(nn.Module):
             * u.unsqueeze(-1)      # [B, L, d_inner, 1]
         )                                               # [B, L, d_inner, d_state]
 
-        # Sequential recurrence
-        h = torch.zeros(
-            B_b, d_inner, d_state,
-            device=u.device, dtype=u.dtype
-        )                                               # [B, d_inner, d_state]
-        ys = []
-        for t in range(L):
-            # h[t] = Ā[t] * h[t-1] + B̄[t]
-            h = deltaA[:, t, :, :] * h + deltaB_u[:, t, :, :]  # [B, di, ds]
-            # y[t] = Σ_s h[t,i,s] * C[t,s]
-            y_t = (h * C[:, t, None, :]).sum(dim=-1)            # [B, d_inner]
-            ys.append(y_t)
+        # ── Parallel scan (vectorized, no Python loop) ───────────────────
+        # Closed-form solution of h[t] = Ā[t]*h[t-1] + B̄[t],  h[-1] = 0:
+        #
+        #   cum_a[t]  = ∏_{s=0}^{t} Ā[s]          (cumprod along L)
+        #   h[t]      = cum_a[t] * cumsum(B̄ / cum_a)[t]
+        #   y[t]      = Σ_s  h[t,i,s] * C[t,s]
+        #
+        # Replaces the O(L) Python for-loop with a single fused NumPy-style
+        # tensor operation — all 700 time steps computed in parallel on the GPU.
 
-        y = torch.stack(ys, dim=1)                     # [B, L, d_inner]
-        y = y + u * D[None, None, :]                   # skip connection
+        # cum_a[b,t,i,s] = ∏_{r=0..t} Ā[b,r,i,s]
+        cum_a = torch.cumprod(deltaA, dim=1)            # [B, L, d_inner, d_state]
+
+        # ratio[b,t,i,s] = B̄[b,t,i,s] / cum_a[b,t,i,s]
+        # clamp avoids division by zero (cum_a is always positive but may underflow)
+        ratio = deltaB_u / cum_a.clamp(min=1e-30)       # [B, L, d_inner, d_state]
+
+        # h[b,t,i,s] = cum_a[t] * cumsum(ratio)[t]
+        h = cum_a * torch.cumsum(ratio, dim=1)           # [B, L, d_inner, d_state]
+
+        # y[b,t,i] = Σ_s h[b,t,i,s] * C[b,t,s]
+        y = (h * C[:, :, None, :]).sum(dim=-1)           # [B, L, d_inner]
+        y = y + u * D[None, None, :]                     # skip connection
         return y
 
     # ─────────────────────────────────────────────────────────────────────────
